@@ -15,12 +15,15 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
+import java.security.Permission;
+
 @Service
 public class JavaExecutorService {
-
-    private static final long EXECUTION_TIMEOUT_MS = 1000; // 1 second timeout
+    private static final long EXECUTION_TIMEOUT_MS = 1000;
+    private static final int MAX_OUTPUT_SIZE = 1024;
 
     public CodeExecutionResponse executeCode(String sourceCode) {
+        ThreadGroup threadGroup = new ThreadGroup("CodeExecution");
         try {
             // Create a temporary file for the Java class
             String className = "Main";  // Changed to Main
@@ -57,31 +60,42 @@ public class JavaExecutorService {
             }
 
             // Execute the compiled code with timeout
-            ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
-            PrintStream printStream = new PrintStream(outputStream);
-            PrintStream oldOut = System.out;
-            System.setOut(printStream);
-
             try {
-                Future<Object> future = Executors.newSingleThreadExecutor().submit(() -> {
-                    Class<?> dynamicClass = classLoader.loadClass(className);
-                    // Call main method instead of execute
-                    String[] args = new String[0];
-                    dynamicClass.getMethod("main", String[].class).invoke(null, (Object) args);
-                    return outputStream.toString();
-                });
+                // Create a separate process to run the code
+                ProcessBuilder processBuilder = new ProcessBuilder("java", className);
+                processBuilder.redirectErrorStream(true);
+                Process process = processBuilder.start();
 
-                try {
-                    Object result = future.get(EXECUTION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                    String output = result != null ? result.toString() : "";
-                    return new CodeExecutionResponse(output, null, true);
-                } catch (TimeoutException e) {
-                    future.cancel(true);
-                    return new CodeExecutionResponse(null, "Execution timed out (exceeded 1 second)", false);
+                // Read the output in a separate thread
+                StringBuilder output = new StringBuilder();
+                Thread outputThread = new Thread(() -> {
+                    try (BufferedReader reader = new BufferedReader(
+                            new InputStreamReader(process.getInputStream()))) {
+                        String line;
+                        while ((line = reader.readLine()) != null) {
+                            output.append(line).append("\n");
+                        }
+                    } catch (IOException e) {
+                        // Ignore interruption
+                    }
+                });
+                outputThread.start();
+
+                // Wait for completion or timeout
+                boolean completed = process.waitFor(EXECUTION_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                if (!completed) {
+                    process.destroyForcibly();
+                    outputThread.interrupt();
+                    return new CodeExecutionResponse(null, "Time Limit Exceeded (1 second)", false);
                 }
+
+                // Get the output
+                String result = output.toString();
+                if (result.length() > MAX_OUTPUT_SIZE) {
+                    result = result.substring(0, MAX_OUTPUT_SIZE) + "\n... Output truncated ...";
+                }
+                return new CodeExecutionResponse(result, null, true);
             } finally {
-                System.setOut(oldOut);
-                classLoader.close();
                 new File(className + ".class").delete();
             }
         } catch (Exception e) {
